@@ -1,104 +1,45 @@
 import math
+
 import torch
 import torch.nn as nn
+
 from sglang.srt.layers.layernorm import LayerNorm
-from sglang.srt.layers.linear import ColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 
 
-def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
-    closest_power_of_2 = 2 ** math.floor(math.log2(total_num_heads))
-    base = torch.tensor(
-        2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))),
-        dtype=torch.float32,
-    )
-    powers = torch.arange(1, 1 + closest_power_of_2, dtype=torch.int32)
-    slopes = torch.pow(base, powers)
-
-    if closest_power_of_2 != total_num_heads:
-        extra_base = torch.tensor(
-            2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3))),
-            dtype=torch.float32,
-        )
-        num_remaining_heads = min(
-            closest_power_of_2, total_num_heads - closest_power_of_2
-        )
-        extra_powers = torch.arange(
-            start=1, end=1 + 2 * num_remaining_heads, step=2, dtype=torch.int32
-        )
-        slopes = torch.cat([slopes, torch.pow(extra_base, extra_powers)], dim=0)
-    return slopes
-
-def reorder_falcon_qkv_bias(bias, num_heads, head_dim):
-    bias = bias.view(
-        num_heads,
-        3,
-        head_dim,
-    )
-
-    q = bias[:, 0, :].reshape(-1)
-    k = bias[:, 1, :].reshape(-1)
-    v = bias[:, 2, :].reshape(-1)
-
-    return torch.cat([q, k, v], dim=0)
-
-def reorder_falcon_qkv_weight(weight, num_heads, head_dim):
-            in_dim = weight.shape[1]
-    
-            
-            weight = weight.view(
-                num_heads,
-                3,
-                head_dim,
-                in_dim,
-            )
-    
-    
-            q = weight[:, 0, :, :].reshape(
-                num_heads * head_dim,
-                in_dim,
-            )
-    
-            
-            k = weight[:, 1, :, :].reshape(
-                num_heads * head_dim,
-                in_dim,
-            )
-    
-          
-            v = weight[:, 2, :, :].reshape(
-                num_heads * head_dim,
-                in_dim,
-            )
-    
-            return torch.cat([q, k, v], dim=0)
-
 class FalconDecoderLayer(nn.Module):
     def __init__(self, config, layer_id):
         super().__init__()
-        self.LayerNorm = LayerNorm
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
-        self.num_kv_heads = getattr(
-            config,
-            "num_kv_heads",
-            None,
-        ) or self.num_heads
+        self.num_kv_heads = (
+            getattr(
+                config,
+                "num_kv_heads",
+                None,
+            )
+            or self.num_heads
+        )
 
         alibi_slopes_tensor = _get_alibi_slopes(self.num_heads).cuda()
 
-        self.Attention = RadixAttention(
+        self.attention = RadixAttention(
             num_kv_heads=self.num_kv_heads,
             num_heads=config.num_attention_heads,
             head_dim=config.hidden_size // config.num_attention_heads,
             scaling=(config.hidden_size // config.num_attention_heads) ** -0.5,
             layer_id=layer_id,
         )
-        self.Attention.alibi_slopes = alibi_slopes_tensor
+        self.attention.alibi_slopes = alibi_slopes_tensor
 
         self.attn_dense = RowParallelLinear(
             input_size=self.hidden_size,
@@ -116,38 +57,35 @@ class FalconDecoderLayer(nn.Module):
 
         self.gelu = nn.GELU()
 
-        intermediate_size = getattr(
-            config, "intermediate_size", config.hidden_size * 4
-        )
+        intermediate_size = getattr(config, "intermediate_size", config.hidden_size * 4)
 
-        self.UP_projection = ColumnParallelLinear(
+        self.up_projection = ColumnParallelLinear(
             input_size=self.hidden_size,
             output_size=intermediate_size,
             bias=getattr(config, "bias", False),
         )
 
-        self.Undo_wide = RowParallelLinear(
+        self.down_projection = RowParallelLinear(
             input_size=intermediate_size,
             output_size=self.hidden_size,
             bias=getattr(config, "bias", False),
         )
 
-        self.input_layernorm = self.LayerNorm(
+        self.input_layernorm = LayerNorm(
             self.hidden_size,
             eps=config.layer_norm_epsilon,
         )
 
-        self.post_attention_layernorm = self.LayerNorm(
+        self.post_attention_layernorm = LayerNorm(
             self.hidden_size,
-                eps=config.layer_norm_epsilon,
-                )
+            eps=config.layer_norm_epsilon,
+        )
 
+    def forward(self, hidden_states, positions, forward_batch):
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
 
-
-    def forward(self, X, positions, forward_batch):
-        X_cleaned = self.input_layernorm(X)
-
-        qkv, _ = self.attn_proj(X_cleaned)
+        qkv, _ = self.attn_proj(hidden_states)
 
         q_size = self.num_heads * self.head_dim
         kv_size = self.num_kv_heads * self.head_dim
@@ -159,20 +97,19 @@ class FalconDecoderLayer(nn.Module):
 
         v = v.contiguous()
 
-        att_output = self.Attention(q, k, v, forward_batch)
-        
-        att_output, _ = self.attn_dense(att_output)
+        hidden_states = self.attention(q, k, v, forward_batch)
+        hidden_states, _ = self.attn_dense(hidden_states)
 
-        X = X + att_output
+        hidden_states = residual + hidden_states
 
-        mlp_input = self.post_attention_layernorm(X)
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
 
-        X_wide, _ = self.UP_projection(mlp_input)
-        X_gelu = self.gelu(X_wide)
-        mlp_output, _ = self.Undo_wide(X_gelu)
+        hidden_states, _ = self.up_projection(hidden_states)
+        hidden_states = self.gelu(hidden_states)
+        hidden_states, _ = self.down_projection(hidden_states)
 
-        output = X + mlp_output
-        return output
+        return residual + hidden_states
 
 
 class FalconModel(nn.Module):
@@ -192,13 +129,13 @@ class FalconModel(nn.Module):
         )
 
     def forward(self, input_ids, positions, forward_batch):
-        hidden_States = self.embed_tokens(input_ids)
+        hidden_states = self.embed_tokens(input_ids)
 
         for layer in self.layers:
-            hidden_States = layer(hidden_States, positions, forward_batch)
+            hidden_states = layer(hidden_states, positions, forward_batch)
 
-        hidden_States = self.final_layernorm(hidden_States)
-        return hidden_States
+        hidden_states = self.final_layernorm(hidden_states)
+        return hidden_states
 
 
 class FalconForCausalLM(nn.Module):
@@ -220,9 +157,7 @@ class FalconForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    
-
-    @torch.no_grad
+    @torch.no_grad()
     def load_weights(self, weights_iterable):
         for name, loaded_weight in weights_iterable:
 
@@ -264,7 +199,7 @@ class FalconForCausalLM(nn.Module):
 
                 elif name_inside_layer == "self_attention.query_key_value.weight":
 
-                    loaded_weight = reorder_falcon_qkv_weight(
+                    loaded_weight = _reorder_falcon_qkv_weight(
                         loaded_weight,
                         layer.num_heads,
                         layer.head_dim,
@@ -283,7 +218,7 @@ class FalconForCausalLM(nn.Module):
 
                 elif name_inside_layer == "self_attention.query_key_value.bias":
 
-                    loaded_weight = reorder_falcon_qkv_bias(
+                    loaded_weight = _reorder_falcon_qkv_bias(
                         loaded_weight,
                         layer.num_heads,
                         layer.head_dim,
@@ -300,7 +235,6 @@ class FalconForCausalLM(nn.Module):
                         loaded_weight,
                     )
 
-
                 elif name_inside_layer == "self_attention.dense.bias":
                     weight_loader = getattr(
                         layer.attn_dense.bias,
@@ -309,49 +243,111 @@ class FalconForCausalLM(nn.Module):
                     )
                     weight_loader(layer.attn_dense.bias, loaded_weight)
 
-
                 elif name_inside_layer == "mlp.dense_h_to_4h.bias":
                     weight_loader = getattr(
-                        layer.UP_projection.bias,
+                        layer.up_projection.bias,
                         "weight_loader",
                         default_weight_loader,
                     )
-                    weight_loader(layer.UP_projection.bias, loaded_weight)
-
+                    weight_loader(layer.up_projection.bias, loaded_weight)
 
                 elif name_inside_layer == "mlp.dense_4h_to_h.bias":
                     weight_loader = getattr(
-                        layer.Undo_wide.bias,
+                        layer.down_projection.bias,
                         "weight_loader",
                         default_weight_loader,
                     )
-                    weight_loader(layer.Undo_wide.bias, loaded_weight)
+                    weight_loader(layer.down_projection.bias, loaded_weight)
 
                 elif name_inside_layer == "mlp.dense_h_to_4h.weight":
                     weight_loader = getattr(
-                        layer.UP_projection.weight,
+                        layer.up_projection.weight,
                         "weight_loader",
                         default_weight_loader,
                     )
-                    weight_loader(layer.UP_projection.weight, loaded_weight)
+                    weight_loader(layer.up_projection.weight, loaded_weight)
 
                 elif name_inside_layer == "mlp.dense_4h_to_h.weight":
                     weight_loader = getattr(
-                        layer.Undo_wide.weight,
+                        layer.down_projection.weight,
                         "weight_loader",
                         default_weight_loader,
                     )
-                    weight_loader(layer.Undo_wide.weight, loaded_weight)
+                    weight_loader(layer.down_projection.weight, loaded_weight)
 
                 elif name_inside_layer == "self_attention.dense.weight":
                     weight_loader = getattr(
                         layer.attn_dense.weight,
                         "weight_loader",
-                        default_weight_loader,  
+                        default_weight_loader,
                     )
                     weight_loader(layer.attn_dense.weight, loaded_weight)
 
-               
+
+def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
+    closest_power_of_2 = 2 ** math.floor(math.log2(total_num_heads))
+    base = torch.tensor(
+        2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))),
+        dtype=torch.float32,
+    )
+    powers = torch.arange(1, 1 + closest_power_of_2, dtype=torch.int32)
+    slopes = torch.pow(base, powers)
+
+    if closest_power_of_2 != total_num_heads:
+        extra_base = torch.tensor(
+            2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3))),
+            dtype=torch.float32,
+        )
+        num_remaining_heads = min(
+            closest_power_of_2, total_num_heads - closest_power_of_2
+        )
+        extra_powers = torch.arange(
+            start=1, end=1 + 2 * num_remaining_heads, step=2, dtype=torch.int32
+        )
+        slopes = torch.cat([slopes, torch.pow(extra_base, extra_powers)], dim=0)
+    return slopes
+
+
+def _reorder_falcon_qkv_bias(bias, num_heads, head_dim):
+    bias = bias.view(
+        num_heads,
+        3,
+        head_dim,
+    )
+
+    q = bias[:, 0, :].reshape(-1)
+    k = bias[:, 1, :].reshape(-1)
+    v = bias[:, 2, :].reshape(-1)
+
+    return torch.cat([q, k, v], dim=0)
+
+
+def _reorder_falcon_qkv_weight(weight, num_heads, head_dim):
+    in_dim = weight.shape[1]
+
+    weight = weight.view(
+        num_heads,
+        3,
+        head_dim,
+        in_dim,
+    )
+
+    q = weight[:, 0, :, :].reshape(
+        num_heads * head_dim,
+        in_dim,
+    )
+
+    k = weight[:, 1, :, :].reshape(
+        num_heads * head_dim,
+        in_dim,
+    )
+
+    v = weight[:, 2, :, :].reshape(
+        num_heads * head_dim,
+        in_dim,
+    )
+
+    return torch.cat([q, k, v], dim=0)
 
 
 EntryClass = [FalconForCausalLM]
